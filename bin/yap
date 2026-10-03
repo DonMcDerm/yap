@@ -187,14 +187,23 @@ focused_title() { hyprctl -j activewindow 2>/dev/null | jq -r '.title // "?"' 2>
 paste_chord() {
   case "${1:-}" in
     *ghostty*|*kitty*|*alacritty*|*wezterm*|*foot*|*xterm*|*konsole*|*gnome-terminal*|*Console*)
-      printf 'ctrl+shift+v' ;;
+      printf 'shift+insert' ;;
     *) printf 'ctrl+v' ;;
   esac
 }
 
+# Clear modifiers that may still be physically held from the keybind that started us, then send ONE
+# paste keystroke. Held modifiers are not cosmetic: SUPER+SHIFT+H leaves super down, so the chord
+# becomes super+shift+insert — no keybind matches that, the terminal encodes it for the app instead,
+# and with the Hermes CLI's modifyOtherKeys active (it pushes ESC[>4;2m for ghostty) it arrives as
+# ESC[27;14;118~ and gets inserted as literal text. wtype's names for Mod4 are logo/win; `super`,
+# `meta`, `mod4` and `control` are all rejected. Releases are harmless when nothing is held.
 send_paste() {
-  case "$(paste_chord "$1")" in
-    ctrl+shift+v) wtype -M ctrl -M shift -k v -m shift -m ctrl ;;
+  local chord; chord="$(paste_chord "$1")"
+  wtype -m ctrl -m shift -m alt -m logo -m win >/dev/null 2>&1
+  sleep 0.12
+  case "$chord" in
+    shift+insert) wtype -M shift -k insert -m shift ;;
     *)            wtype -M ctrl -k v -m ctrl ;;
   esac
 }
@@ -223,6 +232,8 @@ deliver() {
   fi
 
   if [ -n "$start_addr" ] && [ "$cur" != "$start_addr" ]; then
+    printf 'delivery: skipped(focus moved) chord=%s target=%s class=%s start=%s\n' \
+      "$chord" "${cur:-none}" "${cls:-?}" "${start_addr:-none}" >>"$LOG"
     osd "copied · focus moved" "" 4000 microphone
     notify 12000 "yap: transcript ready — focus changed, nothing pasted" \
       "SUPER+SHIFT+H inserts it here · recorded from: ${START_TITLE:-?}${cap_note}"
@@ -235,11 +246,14 @@ deliver() {
   fi
 
   if send_paste "$cls"; then
+    printf 'delivery: sent chord=%s target=%s class=%s chars=%s\n' \
+      "$chord" "${cur:-none}" "${cls:-?}" "${#text}" >>"$LOG"
     # short by design: the OSD elides around 22 characters
     osd "pasted · ${ms}ms${cap_note}" "" 2500 microphone
     return 0
   fi
 
+  printf 'delivery: wtype-failed chord=%s target=%s\n' "$chord" "${cur:-none}" >>"$LOG"
   notify 10000 "yap: could not paste here" \
     "text is on the clipboard and in ~/.cache/yap/last.txt — SUPER+SHIFT+H to insert"
   return 1
