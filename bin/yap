@@ -211,8 +211,6 @@ send_paste() {
 # ── delivery ──────────────────────────────────────────────────────────────────────
 deliver() {
   local text="$1" start_addr="$2" dur="$3" ms="$5" cap_note="$6"
-  printf '%s\n' "$text" >"$LAST"
-  printf '%s' "$text" | wl-copy 2>/dev/null
 
   local cur cls chord
   cur="$(focused_addr)"; cls="$(focused_class)"; chord="$(paste_chord "$cls")"
@@ -240,7 +238,14 @@ deliver() {
     return 2
   fi
 
+  # Store BEFORE anything can be typed — but only on the real delivery path. Doing this at the top
+  # of deliver() meant --dry-run wrote its 40-char PREVIEW over $LAST and the clipboard, destroying
+  # the previous transcript (found the hard way, 2026-10-03).
+  printf '%s\n' "$text" >"$LAST"
+  printf '%s' "$text" | wl-copy 2>/dev/null
+
   if [ "$NO_TYPE" = 1 ]; then
+    printf 'delivery: skipped(--no-type) chord=%s target=%s\n' "$chord" "${cur:-none}" >>"$LOG"
     echo "no-type: transcript on the clipboard and in $LAST"
     return 0
   fi
