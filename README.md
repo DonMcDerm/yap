@@ -1,67 +1,47 @@
 # yap
 
-Push-to-talk dictation for **Omarchy**. Hit `SUPER+H`, talk, hit it again — the transcript
-appears in the window you started in, usually in well under a second.
+Push-to-talk dictation for **Omarchy**: press a key, talk, press it again, and your words appear
+in the window you were already in. The model runs on your own GPU and stays loaded, so a sentence
+lands in well under a second.
 
-This is Omarchy-specific on purpose. The progress popup is Omarchy's OSD, and the binds are
-Omarchy's `o.bind` lines, so another desktop means porting it, not installing it. `AGENTS.md`
-says which two functions to swap if you want to.
+## Getting it installed
 
-## Install
+Don't do this by hand. Hand it to your coding agent — paste this:
 
-    git clone https://github.com/DonMcDerm/yap ~/projects/yap
-    cd ~/projects/yap
-    ./install.sh
+    Install yap from https://github.com/DonMcDerm/yap, following AGENTS.md.
 
-Then paste the two lines from `examples/hyprland.lua` into `~/.config/hypr/bindings.lua`, reload,
-and check the microphone before you trust it:
+That is the whole setup, and `AGENTS.md` is written for exactly that job. The likely outcome is
+that the agent does everything and hands you back one small chore: adding the two keybind lines
+to your Hyprland config, which it cannot do safely for you.
 
-    hyprctl reload && ~/.local/bin/yap --check
+## Using it
 
-`--check` names the input device and shows a two-second live level, so a muted or unplugged mic
-is obvious instead of silently transcribing nothing.
+    SUPER + H            start recording, press again to stop
+    SUPER + SHIFT + H    put the last transcript wherever you are now
 
-## Use
+While you talk, a small popup shows a microphone and the seconds ticking. When you stop, it turns
+into a progress bar (real progress, read off the decoder) and then flashes `pasted · 380ms` if the
+text went in.
 
-    SUPER + H            start / stop recording
-    SUPER + SHIFT + H    insert the last transcript where you are now
+If you clicked over to another window before you stopped talking, yap does **not** type into it.
+Nothing is lost: the transcript is on your clipboard and a notification says so, and
+`SUPER+SHIFT+H` drops it wherever you are now.
 
-    yap --check          input device + live level
-    yap --dry-run        print what it would do with the focused window; types nothing
-    yap --last           insert (or only copy) the last transcript
+The very first dictation after a login is slower, because the model has to load. After that it
+stays resident and the wait disappears.
 
-Every transcript is written to the clipboard and to `~/.cache/yap/last.txt` before anything is
-typed, so `SUPER+SHIFT+H` or Ctrl+V gets it back if the paste doesn't land.
+## Tips
 
-## Settings
-
-All optional, in `~/.config/yap/config`:
-
-    YAP_REMOTE="ssh -i ~/.ssh/key user@host ~/.local/bin/transcribe-stdin"   # fallback, off by default
-    YAP_MAX_SECS=600      # recording cap; hitting it stops and delivers like any other stop
-    YAP_SILENCE_DB=-60    # a clip peaking at or below this counts as no audio at all
-
-The daemon's settings live in the unit `install.sh` writes: `YAP_MODEL` (default `small.en`),
-`YAP_DEVICE`, `YAP_THREADS`, `YAP_BEAM`, and `YAP_PROMPT` — or `~/.config/yap/prompt.txt` — for
-your recurring vocabulary.
-
-## What it needs
-
-Omarchy, plus `ffmpeg`, `ffprobe`, `pactl`, `jq`, `wtype`, `wl-copy`, `notify-send` and python3.
-An NVIDIA GPU is optional: without one it runs on the CPU, around 20x slower than realtime.
-
-## More detail
-
-- **The model stays loaded.** A small daemon holds the whisper model on the GPU and accepts
-  clips over a unix socket, so there is no process start and no reload per utterance.
-- **Delivery is one paste keystroke at most**, and only if the window focused when you started
-  recording is still focused. An earlier version streamed the text as synthetic keystrokes; a
-  keypress mid-stream sent the rest of the transcript into another window, so yap never streams.
-  If focus moved, nothing is typed at all and a notification says so.
-- **The progress bar is real** — percentages come from the decoder as it advances, not from an
-  estimate.
-- Everything else — measured numbers, the socket protocol, the pitfalls that cost real time, and
-  how to test it without a microphone or a desktop — is in `AGENTS.md`.
+- **You talk and nothing ever appears.** That is the microphone, not yap — usually the wrong
+  input device, or a muted one. Run `yap --check`: it names the input device and shows a
+  two-second live level.
+- **The transcript is never only in the pasted place.** It also goes to the clipboard and to
+  `~/.cache/yap/last.txt`, so Ctrl+V works even if an app ignored the paste.
+- **Long recordings are fine but capped** (ten minutes by default). Hit the cap and it delivers
+  what it has, marked in the popup, rather than throwing the recording away.
+- **Anything you'd like different** — a bigger model, your own vocabulary, a fallback when the
+  desktop is asleep — is a settings line rather than a fork. Ask your agent; the options are in
+  `AGENTS.md`.
 
 ## License
 
