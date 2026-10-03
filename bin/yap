@@ -1,0 +1,591 @@
+#!/usr/bin/env bash
+# yap — push-to-talk dictation into the window you started in.
+#
+#   SUPER+H        start / stop recording
+#   SUPER+SHIFT+H  insert the last transcript where you are now
+#   yap --check [--source NAME]      input device + live level, exit
+#   yap --last [--no-type]           insert (or only copy) the last transcript
+#   yap --transcribe-test [FILE]     run a wav through the daemon, print the progress sequence
+#   yap --dry-run                    say what it would do with the focused window, send nothing
+#   yap --deliver-test               assert a focus change can't type into the wrong window
+#   yap --bar-test                   render the progress-bar strings + chord selection
+#   yap --progress-test [secs]       drive both OSD phases
+#
+# SOCKET PROTOCOL (v4, 2026-10-03): the daemon now streams REAL progress.
+#   client -> daemon: 8 ASCII digits (byte length) + raw audio
+#   daemon -> client: FRAME = type byte + 8 ASCII digits (payload length) + payload
+#       \x01 <len> <percent>          progress, emitted as the decoder advances
+#       \x02 <len> <utf-8 transcript> final text, then the daemon closes
+# Control bytes cannot occur in a transcript, so if the first byte is neither \x01 nor \x02 the
+# client treats the whole stream as raw text — that keeps it working against an older daemon.
+#
+# DELIVERY MODEL. Two hard lessons, both from real breakage:
+#   1. NEVER stream the transcript as synthetic keystrokes. Typing 5.5k characters with `wtype`
+#      takes seconds and every stray key you press mid-flight (Tab!) retargets the remaining
+#      text into another window — the tool ends up driving the desktop. Delivery is ONE paste
+#      keystroke, or nothing at all.
+#   2. Only deliver if the window focused NOW is the window focused when recording STARTED;
+#      otherwise the text stays on the clipboard and a notification says so. No focus stealing.
+#
+# Before any of that, the transcript is written to ~/.cache/yap/last.txt and the clipboard. It
+# cannot be lost after that point — `yap --last` (SUPER+SHIFT+H) puts it back anywhere.
+#
+# CONFIG. Nothing site-specific lives in this script. If ~/.config/yap/config exists it is
+# sourced before anything runs, and every value below has a default:
+#   YAP_REMOTE="ssh -i ~/.ssh/key user@host transcribe-stdin"   optional fallback (see below)
+#   YAP_REMOTE_TIMEOUT=180   YAP_DIR=~/.cache/yap   YAP_SOCK=$YAP_DIR/stt.sock
+#   YAP_MAX_SECS=600         YAP_SILENCE_DB=-60
+#
+# PROGRESS: Omarchy's OSD, a single surface updated in place (the same one the volume keys use).
+# Per-second notify-send updates were wrong here — quickshell re-shows the popup, so they stacked
+# a column of popups over the top-right corner.
+#   * RECORDING = microphone icon + elapsed seconds, text mode, no bar. Nothing to fill yet.
+#   * TRANSCRIBING = the bar, driven by the daemon's real percentages (not an estimate), with the
+#     same seconds readout; it falls back to a text message if the daemon reports no progress
+#     (e.g. the remote fallback path, which has no framing).
+#   * The OSD draws a bar only when the message is EMPTY (`hasProgress` needs `rawMessage === ""`)
+#     and elides text at maxMessageWidth (Style.space(190), ~22 chars): bar -> value with no
+#     message; text -> short message with no value.
+#   * A custom readout (seconds, not "<pct>%") needs the shell IPC directly: the omarchy-osd CLI
+#     hardcodes progressText.
+#
+# Input failures are reported instead of failing silently: no mic connected (detected before
+# recording, from port availability), pure silence (from the clip's own volumedetect levels), and
+# "nothing transcribed" (with the measured level).
+set -uo pipefail
+
+# ── config ────────────────────────────────────────────────────────────────────────
+# shellcheck source=/dev/null
+[ -r "${XDG_CONFIG_HOME:-$HOME/.config}/yap/config" ] && . "${XDG_CONFIG_HOME:-$HOME/.config}/yap/config"
+
+SD="${YAP_DIR:-$HOME/.cache/yap}"
+PIDF="$SD/rec.pid"
+LOG="$SD/last.log"
+CLIP="$SD/clip.wav"
+SOCK="${YAP_SOCK:-$SD/stt.sock}"
+LAST="$SD/last.txt"
+MARKS="$SD/.transcribing"
+PROG="$SD/progress"
+SILENCE_DB="${YAP_SILENCE_DB:--60}"   # clip peak at or below this = nothing was picked up at all
+MAXSECS="${YAP_MAX_SECS:-600}"
+
+# Fallback when the local daemon returns nothing: ANY command that reads audio on stdin and
+# prints the transcript on stdout. Empty (the default) = no fallback at all.
+REMOTE_CMD="${YAP_REMOTE:-}"
+REMOTE_TIMEOUT="${YAP_REMOTE_TIMEOUT:-180}"
+mkdir -p "$SD"
+
+MODE="talk"
+SRC_OVERRIDE=""
+NO_TYPE=0
+TFILE=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --check)           MODE="check"; shift ;;
+    --last)            MODE="last"; shift ;;
+    --deliver-test)    MODE="deliver-test"; shift ;;
+    --dry-run)         MODE="dry-run"; shift ;;
+    --bar-test)        MODE="bar-test"; shift ;;
+    --transcribe-test) MODE="transcribe-test"; TFILE="${2:-}"; shift; [ -n "${TFILE:-}" ] && shift ;;
+    --progress-test)   MODE="progress-test"; PTSECS="${2:-6}"; shift 2 ;;
+    --no-type)         NO_TYPE=1; shift ;;
+    --source)          SRC_OVERRIDE="${2:-}"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+
+notify() {
+  command -v notify-send >/dev/null 2>&1 && notify-send -a yap -t "$1" "$2" "${3:-}"
+  return 0
+}
+
+# Same bubble every time (replace-id): for progress-shaped messages on a desktop with no
+# Omarchy OSD, where a new bubble per second would stack down the corner.
+notify_repl() {
+  command -v notify-send >/dev/null 2>&1 && notify-send -a yap -r 9911 -t "$1" "$2" "${3:-}"
+  return 0
+}
+
+# ── progress via the Omarchy OSD (one surface, updated in place) ───────────────────
+# osd <message> [progress 0-100] [duration ms] [icon]
+# Text mode: message only. Bar mode: progress only, empty message.
+osd() {
+  local msg="$1" prog="${2:-}" dur="${3:-4000}" icon="${4:-}"
+  if ! command -v omarchy-osd >/dev/null 2>&1; then
+    notify_repl "$dur" "yap" "${msg:-transcribing…}"
+    return 0
+  fi
+  local args=(-d "$dur")
+  [ -n "$icon" ] && args+=(-i "$icon")
+  [ -n "$msg" ]  && args+=(-m "$msg")
+  [ -n "$prog" ] && args+=(-p "$prog")
+  omarchy-osd "${args[@]}" >/dev/null 2>&1
+  return 0
+}
+
+# Bar mode with a custom readout. The `omarchy-osd` CLI always writes "<pct>%" into progressText,
+# so showing seconds needs the shell IPC directly. hasProgress still holds because the message is
+# empty; the derived message becomes progressText.
+osd_bar() {   # osd_bar <readout> <pct> [duration] [icon]
+  local text="$1" pct="${2:-0}" dur="${3:-4000}" icon="${4:-microphone}"
+  if command -v omarchy-shell >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
+    local payload
+    payload="$(jq -cn --arg i "$icon" --arg t "$text" --arg v "$pct" --arg d "$dur" \
+      '{icon:$i,message:"",value:$v,max:"100",progressText:$t,duration:$d}')"
+    omarchy-shell -q osd show "$payload" >/dev/null 2>&1 && return 0
+  fi
+  # fall back to the wrapper (shows a percentage instead of the readout)
+  command -v omarchy-osd >/dev/null 2>&1 && omarchy-osd -i "$icon" -p "$pct" -d "$dur" >/dev/null 2>&1 && return 0
+  notify_repl "$dur" "yap" "${text} · ${pct}%"
+  return 0
+}
+
+bar() {
+  local p="${1:-0}"; [ "$p" -gt 100 ] && p=100; [ "$p" -lt 0 ] && p=0
+  local f=$((p / 5)) e=$((20 - p / 5)) out=""
+  # printf with a format and no args still prints once, so the zero cases need guarding
+  [ "$f" -gt 0 ] && out="$(printf '\u2588%.0s' $(seq 1 "$f"))"
+  [ "$e" -gt 0 ] && out="${out}$(printf '\u2591%.0s' $(seq 1 "$e"))"
+  printf '%s %3d%%' "$out" "$p"
+}
+
+# Recording: mic icon + seconds. No bar — nothing to fill while he is still talking.
+recording_progress() {
+  local i=0
+  while [ -f "$PIDF" ]; do
+    osd "${i}s" "" 4000 microphone
+    sleep 1; i=$((i + 1))
+  done
+}
+
+# Transcribing: the bar, from the daemon's real percentages in $PROG (-1 / missing = no data).
+transcribing_progress() {
+  local start last_pct="" last_e="" pct elapsed
+  start="$(date +%s%N)"
+  while [ -f "$MARKS" ]; do
+    pct="$(cat "$PROG" 2>/dev/null)"
+    case "${pct:-}" in ''|*[!0-9]*) pct=-1 ;; esac
+    elapsed=$(( ($(date +%s%N) - start) / 1000000000 ))
+    if [ "$pct" != "$last_pct" ] || [ "$elapsed" != "$last_e" ]; then
+      if [ "$pct" -ge 0 ]; then
+        osd_bar "${elapsed}s" "$pct" 4000 microphone
+      else
+        osd "transcribing… ${elapsed}s" "" 4000 microphone
+      fi
+      last_pct="$pct"; last_e="$elapsed"
+    fi
+    sleep 0.25
+  done
+}
+
+# ── focus + paste ─────────────────────────────────────────────────────────────────
+focused_addr()  { hyprctl -j activewindow 2>/dev/null | jq -r '.address // ""' 2>/dev/null; }
+focused_class() { hyprctl -j activewindow 2>/dev/null | jq -r '.class // ""' 2>/dev/null; }
+focused_title() { hyprctl -j activewindow 2>/dev/null | jq -r '.title // "?"' 2>/dev/null | cut -c1-60; }
+
+# Terminals want ctrl+shift+v; everything else ctrl+v. One keystroke either way.
+paste_chord() {
+  case "${1:-}" in
+    *ghostty*|*kitty*|*alacritty*|*wezterm*|*foot*|*xterm*|*konsole*|*gnome-terminal*|*Console*)
+      printf 'ctrl+shift+v' ;;
+    *) printf 'ctrl+v' ;;
+  esac
+}
+
+send_paste() {
+  case "$(paste_chord "$1")" in
+    ctrl+shift+v) wtype -M ctrl -M shift -k v -m shift -m ctrl ;;
+    *)            wtype -M ctrl -k v -m ctrl ;;
+  esac
+}
+
+# ── delivery ──────────────────────────────────────────────────────────────────────
+deliver() {
+  local text="$1" start_addr="$2" dur="$3" ms="$5" cap_note="$6"
+  printf '%s\n' "$text" >"$LAST"
+  printf '%s' "$text" | wl-copy 2>/dev/null
+
+  local cur cls chord
+  cur="$(focused_addr)"; cls="$(focused_class)"; chord="$(paste_chord "$cls")"
+
+  if [ "$MODE" = "dry-run" ]; then
+    echo "focus now:      ${cur:-none} (class=${cls:-?})"
+    echo "record-start:   ${start_addr:-none}"
+    echo "paste chord:    $chord"
+    if [ -n "$start_addr" ] && [ "$cur" != "$start_addr" ]; then
+      echo "action:         CLIPBOARD ONLY (focus changed)"
+    elif [ "$NO_TYPE" = 1 ]; then
+      echo "action:         CLIPBOARD ONLY (--no-type)"
+    else
+      echo "action:         single $chord paste (no keystroke streaming)"
+    fi
+    return 0
+  fi
+
+  if [ -n "$start_addr" ] && [ "$cur" != "$start_addr" ]; then
+    osd "copied · focus moved" "" 4000 microphone
+    notify 12000 "yap: transcript ready — focus changed, nothing pasted" \
+      "SUPER+SHIFT+H inserts it here · recorded from: ${START_TITLE:-?}${cap_note}"
+    return 2
+  fi
+
+  if [ "$NO_TYPE" = 1 ]; then
+    echo "no-type: transcript on the clipboard and in $LAST"
+    return 0
+  fi
+
+  if send_paste "$cls"; then
+    # short by design: the OSD elides around 22 characters
+    osd "pasted · ${ms}ms${cap_note}" "" 2500 microphone
+    return 0
+  fi
+
+  notify 10000 "yap: could not paste here" \
+    "text is on the clipboard and in ~/.cache/yap/last.txt — SUPER+SHIFT+H to insert"
+  return 1
+}
+
+# ── input device state ─────────────────────────────────────────────────────────────
+src_block() {
+  pactl list sources 2>/dev/null | awk -v s="$1" '
+    $1 == "Name:" { inblock = ($2 == s) }
+    inblock { print }
+  '
+}
+
+src_desc() { src_block "$1" | awk -F': ' '/^[[:space:]]+Description: / { print $2; exit }'; }
+
+# echo one of: missing | unavailable | ok
+#
+# Only ports the kernel reports as EXPLICITLY "not available" mean an empty jack. USB mics
+# (most USB mics) publish "availability unknown" for their single port — treating that as unplugged
+# blocked dictation entirely, so unknown counts as usable.
+src_state() {
+  local block ports notavail
+  block="$(src_block "$1")"
+  [ -n "$block" ] || { echo missing; return; }
+  ports="$(printf '%s\n' "$block" | grep -cE '^[[:space:]]+[A-Za-z0-9._-]+: .*\(type: ')"
+  notavail="$(printf '%s\n' "$block" | grep -cE ', not available\)$')"
+  if [ "$ports" -gt 0 ] && [ "$notavail" -eq "$ports" ]; then echo unavailable; else echo ok; fi
+}
+
+port_states() {
+  src_block "$1" | grep -E '\(type: ' | while IFS= read -r line; do
+    name="$(printf '%s' "$line" | sed -E 's/^[[:space:]]+([A-Za-z0-9._-]+):.*/\1/')"
+    av="$(printf '%s' "$line" | grep -oE '(not available|availability unknown|available)\)$' | tr -d ')')"
+    printf '%s=%s ' "$name" "${av:-unknown}"
+  done
+}
+
+level_now() {
+  local src="$1" secs="${2:-2}"
+  timeout $((secs + 8)) ffmpeg -hide_banner -nostdin -loglevel info -f pulse -i "$src" \
+    -ac 1 -ar 16000 -t "$secs" -af volumedetect -f null - 2>&1 \
+    | grep -E 'max_volume|mean_volume' \
+    | grep -oE '\-?[0-9.]+ dB' | tr -d ' dB' | paste -sd' ' -
+}
+
+default_source() {
+  if [ -n "$SRC_OVERRIDE" ]; then printf '%s' "$SRC_OVERRIDE"; else pactl get-default-source 2>/dev/null; fi
+}
+
+# Ask the warm daemon. Progress frames land in $PROG as percentages; the transcript goes to stdout.
+ask_local() {   # ask_local <wav> [sock] [progress-file]
+  python3 - "$1" "${2:-$SOCK}" "${3:-$PROG}" <<'PY'
+import os, socket, sys
+path, sock_path, prog_path = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    data = open(path, "rb").read()
+except OSError:
+    sys.exit(2)
+if not data:
+    sys.exit(4)
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(180)
+try:
+    s.connect(os.path.expanduser(sock_path))
+except OSError:
+    sys.exit(3)
+s.sendall(b"%08d" % len(data) + data)
+
+
+def write_progress(value):
+    try:
+        with open(prog_path, "w") as fh:
+            fh.write(str(value))
+    except OSError:
+        pass
+
+
+buf = bytearray()
+framed = None          # None = undecided, True = framed daemon, False = raw text daemon
+chunks = []            # transcript pieces
+last_prog = None
+while True:
+    try:
+        chunk = s.recv(65536)
+    except (OSError, socket.timeout):
+        break
+    if not chunk:
+        break
+    buf += chunk
+    if framed is None:
+        framed = buf[0] in (1, 2)          # control byte = new framed daemon
+    if not framed:
+        continue
+    # parse as many complete frames as the buffer holds
+    while len(buf) >= 9:
+        kind = buf[0]
+        if kind not in (1, 2):
+            framed = False                 # protocol slipped — treat the rest as text
+            break
+        try:
+            size = int(bytes(buf[1:9]).decode("ascii"))
+        except ValueError:
+            framed = False
+            break
+        if len(buf) < 9 + size:
+            break                          # wait for the rest of this frame
+        payload = bytes(buf[9:9 + size])
+        del buf[:9 + size]
+        if kind == 1:
+            try:
+                value = int(payload.decode("ascii", "ignore").strip())
+            except ValueError:
+                continue
+            if value != last_prog:
+                last_prog = value
+                write_progress(value)
+        else:
+            chunks.append(payload.decode("utf-8", "replace"))
+if framed:
+    write_progress(100)
+else:
+    chunks.append(bytes(buf).decode("utf-8", "replace"))
+sys.stdout.write("".join(chunks))
+PY
+}
+
+# ── self-tests ────────────────────────────────────────────────────────────────────
+if [ "$MODE" = "bar-test" ]; then
+  for p in 0 12 50 87 100; do echo "$p% -> $(bar "$p")"; done
+  echo "classes: ghostty -> $(paste_chord com.mitchellh.ghostty) | chromium -> $(paste_chord chromium)"
+  echo "osd present: $(command -v omarchy-osd || echo MISSING)"
+  echo "phases: recording = mic + seconds (text) | transcribing = bar (daemon-reported %)"
+  exit 0
+fi
+
+if [ "$MODE" = "transcribe-test" ]; then
+  FILE="${TFILE:-$SD/fixture80.wav}"
+  [ -f "$FILE" ] || { echo "no such file: $FILE"; exit 1; }
+  printf '%s' -1 >"$PROG"
+  : >"$SD/prog-seq.txt"
+  touch "$MARKS"
+  ( while [ -f "$MARKS" ]; do printf '%s\n' "$(cat "$PROG" 2>/dev/null)"; sleep 0.15; done ) \
+    | uniq >"$SD/prog-seq.txt" &
+  SEQ=$!
+  transcribing_progress &
+  TICK=$!
+  OUT="$(ask_local "$FILE" 2>/dev/null | tr -d '\r')"
+  rm -f "$MARKS"
+  sleep 0.4
+  kill "$TICK" "$SEQ" 2>/dev/null
+  echo "progress values seen: $(paste -sd' ' "$SD/prog-seq.txt")"
+  echo "transcript: $(printf '%s' "$OUT" | wc -c) bytes"
+  printf '%s' "$OUT" | head -c 160; echo
+  exit 0
+fi
+
+if [ "$MODE" = "progress-test" ]; then
+  # phase 1: recording look (mic + seconds, no bar)
+  touch "$PIDF"
+  recording_progress &
+  T=$!
+  sleep "$PTSECS"
+  rm -f "$PIDF"
+  kill "$T" 2>/dev/null
+  # phase 2: transcription look (bar + seconds) walking a fake percentage ramp
+  printf '%s' 0 >"$PROG"
+  touch "$MARKS"
+  ( for p in 5 18 34 47 63 78 91 99; do printf '%s' "$p" >"$PROG"; sleep 0.7; done ) &
+  RAMP=$!
+  transcribing_progress &
+  T=$!
+  sleep "$PTSECS"
+  rm -f "$MARKS"
+  kill "$T" "$RAMP" 2>/dev/null
+  echo "phase 1 (mic + seconds) and phase 2 (bar from reported percentages) each ran ~${PTSECS}s"
+  exit 0
+fi
+
+if [ "$MODE" = "dry-run" ]; then
+  [ -s "$LAST" ] && T="$(head -c 40 "$LAST")" || T="(no stored transcript)"
+  deliver "$T" "$(focused_addr)" "0" "dry-run" "0" ""
+  exit $?
+fi
+
+if [ "$MODE" = "deliver-test" ]; then
+  MARK="yap-delivery-self-test-$$"
+  START_TITLE="self-test"
+  if deliver "$MARK" "0xdeadbeef-not-the-focused-window" "0" "test" "0" "" >/dev/null; then
+    echo "FAIL: delivered as if focus had not changed"
+    exit 1
+  fi
+  if [ "$(wl-paste -n 2>/dev/null | head -c 60)" = "$MARK" ]; then
+    echo "PASS: focus change kept the transcript off the keyboard and on the clipboard"
+    exit 0
+  fi
+  echo "FAIL: clipboard holds something else"
+  exit 1
+fi
+
+# ── --last: put the previous transcript where he is NOW ──────────────────────────
+if [ "$MODE" = "last" ]; then
+  if [ ! -s "$LAST" ]; then
+    notify 6000 "yap: nothing to insert" "no transcript recorded yet"
+    echo "no transcript yet"
+    exit 1
+  fi
+  LASTTEXT="$(cat "$LAST")"
+  printf '%s' "$LASTTEXT" | wl-copy 2>/dev/null
+  if [ "$NO_TYPE" = 1 ]; then
+    echo "copied: $(printf '%s' "$LASTTEXT" | head -c 80)"
+    exit 0
+  fi
+  if send_paste "$(focused_class)"; then
+    osd "inserted last" "" 2000 microphone
+    exit 0
+  fi
+  notify 9000 "yap: could not paste" "the text is on the clipboard — paste it manually"
+  exit 1
+fi
+
+# ── --check ───────────────────────────────────────────────────────────────────────
+if [ "$MODE" = "check" ]; then
+  SRC="$(default_source)"
+  if [ -z "$SRC" ]; then
+    echo "default source: (none — pactl reports no default source)"
+    notify 9000 "yap: no input device" "pactl reports no default source"
+    exit 1
+  fi
+  STATE="$(src_state "$SRC")"
+  DESC="$(src_desc "$SRC")"
+  echo "default source: $SRC"
+  echo "  description:  ${DESC:-?}"
+  echo "  port state:   $STATE"
+  printf '  ports:        '
+  port_states "$SRC"
+  echo
+  if [ "$STATE" = "unavailable" ]; then
+    echo "VERDICT: no microphone connected — nothing is plugged into ${DESC:-$SRC}"
+    notify 10000 "yap: no microphone connected" "${DESC:-$SRC} has every input port unplugged"
+    exit 1
+  fi
+  if [ "$STATE" = "missing" ]; then
+    echo "VERDICT: source missing"
+    notify 10000 "yap: input source missing" "$SRC"
+    exit 1
+  fi
+  read -r MAXV MEANV <<<"$(level_now "$SRC" 2)"
+  echo "  live level (2 s): max=${MAXV:-?} dB mean=${MEANV:-?} dB"
+  if [ -n "${MAXV:-}" ] && awk -v m="$MAXV" -v t="$SILENCE_DB" 'BEGIN{exit !(m <= t)}'; then
+    echo "VERDICT: mic open but DEAD SILENT (max ${MAXV} dB) — muted, powered off, or wrong port"
+    notify 10000 "yap: mic is silent" "max ${MAXV} dB — muted or powered off?"
+    exit 1
+  fi
+  echo "VERDICT: microphone ok"
+  exit 0
+fi
+
+# ── second press: stop the recorder ───────────────────────────────────────────────
+if [ -f "$PIDF" ]; then
+  REC="$(cat "$PIDF" 2>/dev/null)"
+  if [ -n "${REC:-}" ] && kill -0 "$REC" 2>/dev/null; then
+    kill -INT "$REC" 2>/dev/null
+    osd "stopping…" "" 1500 microphone
+    exit 0
+  fi
+  rm -f "$PIDF"
+fi
+
+# ── first press: check the input, then record ──────────────────────────────────────
+SRC="$(default_source)"
+if [ -z "$SRC" ]; then
+  notify 9000 "yap: no input device" "pactl reports no default source"
+  exit 1
+fi
+
+STATE="$(src_state "$SRC")"
+if [ "$STATE" != "ok" ]; then
+  DESC="$(src_desc "$SRC")"
+  if [ "$STATE" = "unavailable" ]; then
+    notify 12000 "yap: no microphone connected" \
+      "nothing plugged into ${DESC:-$SRC} — connect it, then press SUPER+H again"
+  else
+    notify 12000 "yap: input source missing" "$SRC is gone — check the device"
+  fi
+  exit 1
+fi
+
+: >"$LOG"
+START_ADDR="$(focused_addr)"
+START_TITLE="$(focused_title)"
+
+ffmpeg -hide_banner -nostdin -loglevel info -f pulse -i "$SRC" \
+  -ac 1 -ar 16000 -t "$MAXSECS" -af volumedetect -y "$CLIP" 2>"$LOG" &
+REC=$!
+echo "$REC" >"$PIDF"
+
+recording_progress &
+TICK=$!
+wait "$REC"
+rm -f "$PIDF"
+kill "$TICK" 2>/dev/null
+
+DUR="$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$CLIP" 2>/dev/null)"
+if [ -z "${DUR:-}" ]; then
+  notify 7000 "yap: capture failed" "$(grep -iE 'error|no such|invalid' "$LOG" | tail -1 | cut -c1-140)"
+  exit 1
+fi
+
+CAP_NOTE=""
+awk -v d="$DUR" -v m="$MAXSECS" 'BEGIN{exit !(d >= m - 2)}' && \
+  CAP_NOTE=" · auto-stopped at the ${MAXSECS}s cap"
+
+MAXV="$(grep -oE 'max_volume: [-0-9.]+ dB' "$LOG" | tail -1 | grep -oE '[-0-9.]+')"
+
+if [ -n "${MAXV:-}" ] && awk -v m="$MAXV" -v t="$SILENCE_DB" 'BEGIN{exit !(m <= t)}'; then
+  cp "$CLIP" "$HOME/yap-failed.wav" 2>/dev/null
+  notify 12000 "yap: recorded silence (max ${MAXV} dB)" \
+    "${DUR}s captured, nothing above ${SILENCE_DB} dB — mic muted, powered off, or the wrong input? clip: ~/yap-failed.wav"
+  exit 1
+fi
+
+T0="$(date +%s%N)"
+printf '%s' -1 >"$PROG"      # no data until the daemon sends a frame
+touch "$MARKS"
+transcribing_progress &
+TTICK=$!
+
+TEXT="$(ask_local "$CLIP" 2>/dev/null | tr -d '\r')"
+WHERE="local"
+if [ -z "${TEXT//[[:space:]]/}" ] && [ -n "$REMOTE_CMD" ]; then
+  WHERE="remote"
+  printf '%s' -1 >"$PROG"     # the remote path has no progress framing
+  TEXT="$(timeout "$REMOTE_TIMEOUT" sh -c "$REMOTE_CMD" <"$CLIP" 2>/dev/null | tr -d '\r')"
+fi
+TEXT="$(printf '%s' "$TEXT" | sed '/^[[:space:]]*$/d')"
+
+rm -f "$MARKS"
+kill "$TTICK" 2>/dev/null
+MS=$(( ($(date +%s%N) - T0) / 1000000 ))
+
+if [ -z "$TEXT" ]; then
+  cp "$CLIP" "$HOME/yap-failed.wav" 2>/dev/null
+  notify 9000 "yap: nothing transcribed" \
+    "dur=${DUR}s peak=${MAXV:-?}dB ${WHERE} ${MS}ms — clip: ~/yap-failed.wav"
+  exit 1
+fi
+
+deliver "$TEXT" "$START_ADDR" "$DUR" "$WHERE" "$MS" "$CAP_NOTE"
+exit $?

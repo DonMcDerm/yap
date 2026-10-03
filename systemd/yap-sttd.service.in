@@ -1,0 +1,20 @@
+[Unit]
+Description=Warm whisper daemon for yap dictation (push-to-talk speech to text)
+Documentation=file://@DATADIR@/sttd.py
+
+[Service]
+Type=simple
+Environment=YAP_MODEL=@MODEL@
+Environment=YAP_DEVICE=auto
+Environment=YAP_THREADS=8
+# CUDA libs from the venv's nvidia-* wheels. They must be in the environment BEFORE python
+# starts: ctranslate2 dlopens libcublas/libcudnn, and the dynamic loader reads LD_LIBRARY_PATH
+# at process start, so setting os.environ inside sttd.py is too late.
+Environment=LD_LIBRARY_PATH=@VENV@/lib/python@PYVER@/site-packages/nvidia/cublas/lib:@VENV@/lib/python@PYVER@/site-packages/nvidia/cudnn/lib:@VENV@/lib/python@PYVER@/site-packages/nvidia/cuda_nvrtc/lib
+ExecStart=@VENV@/bin/python @DATADIR@/sttd.py
+Restart=on-failure
+RestartSec=3
+Nice=5
+
+[Install]
+WantedBy=default.target

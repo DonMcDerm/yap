@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# Read an audio clip on stdin, print the transcript on stdout.
+#
+# The generic remote half of yap's fallback: it runs on whatever box you point YAP_REMOTE at,
+# and it uses the same venv layout install.sh creates, so a second machine costs one
+# `./install.sh --cpu` and nothing else.
+#
+#   YAP_REMOTE="ssh -i ~/.ssh/yap-remote user@host ~/.local/bin/transcribe-stdin"
+#
+# Env (all optional): YAP_REMOTE_VENV (default ~/.local/share/yap/venv), YAP_MODEL,
+# YAP_LANGUAGE, YAP_DEVICE (default cpu here), YAP_COMPUTE (default int8), YAP_THREADS.
+set -euo pipefail
+
+VENV="${YAP_REMOTE_VENV:-$HOME/.local/share/yap/venv}"
+PY="$VENV/bin/python"
+[ -x "$PY" ] || { echo "transcribe-stdin: no python at $PY — set YAP_REMOTE_VENV" >&2; exit 3; }
+
+RAW="$(mktemp -t yap-clip-XXXXXX)"
+WAV="${RAW}.wav"
+trap 'rm -f "$RAW" "$WAV"' EXIT
+cat >"$RAW"
+[ -s "$RAW" ] || { echo "transcribe-stdin: empty input" >&2; exit 2; }
+
+# Normalise to 16 kHz mono: the decoder should never be the thing guessing the container.
+if command -v ffmpeg >/dev/null 2>&1; then
+  ffmpeg -v error -nostdin -i "$RAW" -ac 1 -ar 16000 -y "$WAV" 2>/dev/null || {
+    echo "transcribe-stdin: ffmpeg could not decode the input" >&2
+    exit 4
+  }
+else
+  cp "$RAW" "$WAV"
+fi
+
+"$PY" - "$WAV" <<'PYEOF'
+import os
+import sys
+
+from faster_whisper import WhisperModel
+
+model = WhisperModel(
+    os.environ.get("YAP_MODEL", "small.en"),
+    device=os.environ.get("YAP_DEVICE", "cpu"),
+    compute_type=os.environ.get("YAP_COMPUTE", "int8"),
+    cpu_threads=int(os.environ.get("YAP_THREADS", "8")),
+)
+segments, _ = model.transcribe(
+    sys.argv[1],
+    vad_filter=True,
+    beam_size=1,
+    language=os.environ.get("YAP_LANGUAGE", "en") or None,
+)
+sys.stdout.write("".join(segment.text for segment in segments).strip())
+PYEOF

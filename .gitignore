@@ -1,0 +1,10 @@
+# venv, caches, and anything a previous install backed up
+venv/
+__pycache__/
+*.pyc
+*.bak.*
+*.log
+
+# audio never belongs in a repo: clips, fixtures, failed captures
+*.wav
+yap-failed.wav
