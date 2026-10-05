@@ -9,6 +9,7 @@
 #   yap --dry-run                    say what it would do with the focused window, send nothing
 #   yap --deliver-test               assert a focus change can't type into the wrong window
 #   yap --bar-test                   render the progress-bar strings + chord selection
+#   yap --chord=CHORD                force the paste chord (ctrl+v | shift+insert) — test hook
 #   yap --progress-test [secs]       drive both OSD phases
 #   yap --fail-test                  print every failure message without touching the mic
 #
@@ -89,6 +90,7 @@ MODE="talk"
 SRC_OVERRIDE=""
 NO_TYPE=0
 TFILE=""
+CHORD_OVERRIDE=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --check)           MODE="check"; shift ;;
@@ -101,6 +103,7 @@ while [ $# -gt 0 ]; do
     --progress-test)   MODE="progress-test"; PTSECS="${2:-6}"; shift 2 ;;
     --no-type)         NO_TYPE=1; shift ;;
     --source)          SRC_OVERRIDE="${2:-}"; shift 2 ;;
+    --chord=*)         CHORD_OVERRIDE="${1#--chord=}"; shift ;;
     *) shift ;;
   esac
 done
@@ -205,20 +208,43 @@ paste_chord() {
   esac
 }
 
-# Clear modifiers that may still be physically held from the keybind that started us, then send ONE
-# paste keystroke. Held modifiers are not cosmetic: SUPER+SHIFT+H leaves super down, so the chord
-# becomes super+shift+insert — no keybind matches that, the terminal encodes it for the app instead,
-# and with the Hermes CLI's modifyOtherKeys active (it pushes ESC[>4;2m for ghostty) it arrives as
-# ESC[27;14;118~ and gets inserted as literal text. wtype's names for Mod4 are logo/win; `super`,
-# `meta`, `mod4` and `control` are all rejected. Releases are harmless when nothing is held.
+# ONE paste keystroke, dispatched by the compositor — the mechanism the desktop's own SUPER+V uses.
+#
+# Why not the virtual keyboard: wtype cannot carry the modifiers itself, so the SUPER still held from
+# the keybind merges into the injected chord at the seat. The terminal then sees super+shift+insert,
+# no keybind matches it, and with the Hermes CLI's modifyOtherKeys active (it pushes ESC[>4;2m for
+# ghostty) it arrives as ESC[27;14;118~ and gets inserted as literal text. The old workaround was to
+# release every modifier, wait 120ms for the seat to settle and then inject — a guess at how long a
+# human takes to let go, paid on every single dictation. `send_key_state` carries the mods itself.
+#
+# Down and up go as two dispatches 50ms apart: the same shape Omarchy's clipboard bindings use,
+# because one dispatch that both presses and releases can leave synthetic key state stuck.
+#
+# hyprctl eval is write-only, so a dispatch the compositor rejects looks exactly like one it took:
+# the failure branch below fires on the dispatch's exit status, and either way the transcript is
+# already on the clipboard and in last.txt (`yap --last` puts it back).
 send_paste() {
-  local chord; chord="$(paste_chord "$1")"
-  wtype -m ctrl -m shift -m alt -m logo -m win >/dev/null 2>&1
-  sleep 0.12
+  local chord="${CHORD_OVERRIDE:-}"; [ -n "$chord" ] || chord="$(paste_chord "$1")"
+  local mods key
+  case "$chord" in
+    shift+insert) mods=SHIFT; key=Insert ;;
+    *)            mods=CTRL;  key=V ;;
+  esac
+  if command -v hyprctl >/dev/null 2>&1; then
+    dispatch_key "$mods" "$key" down || return 1
+    sleep 0.05
+    dispatch_key "$mods" "$key" up
+    return 0
+  fi
+  # No compositor Lua to ask (not a Hyprland session): fall back to the virtual keyboard.
   case "$chord" in
     shift+insert) wtype -M shift -k insert -m shift ;;
     *)            wtype -M ctrl -k v -m ctrl ;;
   esac
+}
+
+dispatch_key() {
+  hyprctl eval "hl.dispatch(hl.dsp.send_key_state({mods=\"$1\",key=\"$2\",state=\"$3\"}))" >/dev/null 2>&1
 }
 
 # ── delivery ──────────────────────────────────────────────────────────────────────
@@ -226,7 +252,8 @@ deliver() {
   local text="$1" start_addr="$2" dur="$3" ms="$5" cap_note="$6"
 
   local cur cls chord
-  cur="$(focused_addr)"; cls="$(focused_class)"; chord="$(paste_chord "$cls")"
+  focus_load
+  cur="$F_ADDR"; cls="$F_CLS"; chord="${CHORD_OVERRIDE:-$(paste_chord "$cls")}"
 
   if [ "$MODE" = "dry-run" ]; then
     echo "focus now:      ${cur:-none} (class=${cls:-?})"
