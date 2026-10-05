@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Warm whisper daemon for yap dictation (v4: GPU when available, CPU fallback, live progress).
+"""Warm whisper daemon for yap dictation (v5: GPU when available, CPU fallback, live progress,
+no-speech verdict).
 
 Measured on an 8-core Ryzen 7 5800X3D + RTX 5070 with a 157s fixture (small.en):
     cpu/int8,  8 threads, serial   7.7 s   (20x realtime)
@@ -17,9 +18,13 @@ Protocol on ~/.cache/yap/stt.sock
         length) + payload
             b"\\x01" + len + b"<percent>"      progress, sent as the decoder advances
             b"\\x02" + len + <utf-8 transcript>  the final text, then the daemon closes
+            b"\\x03" + len 0                    no speech: the VAD kept no audio at all, so this
+                                              is sent instead of an empty transcript. A client
+                                              can stop here instead of asking a fallback
+                                              service -- the clip has nothing to say.
     The frame types are control bytes that never occur in a transcript, so a client can
     tell a framed daemon from an older one that replies with raw text: if the first byte
-    is not 1 or 2, treat the whole stream as the transcript.
+    is not 1, 2 or 3, treat the whole stream as the transcript.
 
 Progress comes free: `transcribe()` returns a *generator* of segments, so each iteration
 is one more decoded step and `segment.end / info.duration` is real completion. Frames are
@@ -76,6 +81,7 @@ LOG = HOME / ".cache" / "yap" / "sttd.log"
 
 FRAME_PROGRESS = b"\x01"
 FRAME_TEXT = b"\x02"
+FRAME_NO_SPEECH = b"\x03"
 PROGRESS_MIN_INTERVAL = 0.1
 
 LOG.parent.mkdir(parents=True, exist_ok=True)
@@ -149,7 +155,7 @@ def supports_hotwords(pipe: object) -> bool:
     return bool(_SUPPORTS_HOTWORDS)
 
 
-def transcribe(pipe: object, kind: str, path: str, on_progress=None) -> tuple[str, float]:
+def transcribe(pipe: object, kind: str, path: str, on_progress=None) -> tuple[str, float, float | None]:
     # language=None lets whisper auto-detect; YAP_LANGUAGE decides.
     kwargs: dict[str, object] = {"language": LANGUAGE or None, "vad_filter": True}
     if kind.startswith("batched"):
@@ -160,6 +166,10 @@ def transcribe(pipe: object, kind: str, path: str, on_progress=None) -> tuple[st
         kwargs["hotwords" if supports_hotwords(pipe) else "initial_prompt"] = DEFAULT_PROMPT
     segments, info = pipe.transcribe(path, **kwargs)  # type: ignore[attr-defined]
     total = float(getattr(info, "duration", 0.0) or 0.0)
+    # Audio that survived the VAD. 0.0 alongside empty text means nobody spoke, which the
+    # caller reports as its own verdict instead of as an empty transcript. None = older lib.
+    kept_raw = getattr(info, "duration_after_vad", None)
+    kept = float(kept_raw) if kept_raw is not None else None
     parts: list[str] = []
     last_pct = -1
     last_sent = 0.0
@@ -173,8 +183,8 @@ def transcribe(pipe: object, kind: str, path: str, on_progress=None) -> tuple[st
                 try:
                     on_progress(pct)
                 except OSError:
-                    return "".join(parts).strip(), total
-    return "".join(parts).strip(), total
+                    return "".join(parts).strip(), total, kept
+    return "".join(parts).strip(), total, kept
 
 
 def read_exactly(conn: socket.socket, count: int) -> bytes:
@@ -215,14 +225,20 @@ def handle(conn: socket.socket, pipe: object, kind: str, label: str) -> None:
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as fh:
             fh.write(payload)
             tmp_path = fh.name
-        text, audio_dur = transcribe(pipe, kind, tmp_path, on_progress=progress)
+        text, audio_dur, kept = transcribe(pipe, kind, tmp_path, on_progress=progress)
         elapsed = time.time() - started
         log.info(
-            "%.1fs audio / %d bytes -> %d chars in %.2fs (%.0fx realtime, %s, %d progress frames)",
+            "%.1fs audio / %d bytes -> %d chars in %.2fs (%.0fx realtime, %s, %d progress frames, vad %.2fs)",
             audio_dur, len(payload), len(text), elapsed,
             (audio_dur / elapsed if elapsed else 0), label, sent,
+            kept if kept is not None else -1.0,
         )
-        send_frame(conn, FRAME_TEXT, text.encode("utf-8"))
+        if not text and kept is not None and kept <= 0.05:
+            # The VAD removed the whole clip: nothing to transcribe, here or anywhere.
+            # Saying it explicitly is what lets the client skip a fallback round trip.
+            send_frame(conn, FRAME_NO_SPEECH, b"")
+        else:
+            send_frame(conn, FRAME_TEXT, text.encode("utf-8"))
     except Exception:
         log.exception("transcription failed")
         try:

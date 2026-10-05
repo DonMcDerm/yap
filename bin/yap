@@ -10,14 +10,20 @@
 #   yap --deliver-test               assert a focus change can't type into the wrong window
 #   yap --bar-test                   render the progress-bar strings + chord selection
 #   yap --progress-test [secs]       drive both OSD phases
+#   yap --fail-test                  print every failure message without touching the mic
 #
-# SOCKET PROTOCOL (v4, 2026-10-03): the daemon now streams REAL progress.
+# SOCKET PROTOCOL (v5, 2026-10-05): the daemon streams REAL progress and its own no-speech
+# verdict.
 #   client -> daemon: 8 ASCII digits (byte length) + raw audio
 #   daemon -> client: FRAME = type byte + 8 ASCII digits (payload length) + payload
 #       \x01 <len> <percent>          progress, emitted as the decoder advances
 #       \x02 <len> <utf-8 transcript> final text, then the daemon closes
-# Control bytes cannot occur in a transcript, so if the first byte is neither \x01 nor \x02 the
-# client treats the whole stream as raw text — that keeps it working against an older daemon.
+#       \x03 <len>                    the VAD kept no audio: nobody spoke. The client exits 6,
+#                                     which skips the remote fallback — an empty transcript
+#                                     from the local model is what a fallback is for, and
+#                                     silence is not that.
+# Control bytes cannot occur in a transcript, so if the first byte is not one of the types
+# above the client treats the whole stream as raw text (an older daemon).
 #
 # DELIVERY MODEL. Two hard lessons, both from real breakage:
 #   1. NEVER stream the transcript as synthetic keystrokes. Typing 5.5k characters with `wtype`
@@ -34,6 +40,7 @@
 # sourced before anything runs, and every value below has a default:
 #   YAP_REMOTE="ssh -i ~/.ssh/key user@host transcribe-stdin"   optional fallback (see below)
 #   YAP_REMOTE_TIMEOUT=180   YAP_DIR=~/.cache/yap   YAP_SOCK=$YAP_DIR/stt.sock
+#   YAP_REMOTE_ON_SILENCE=1  run that fallback even when the daemon reports no speech
 #   YAP_MAX_SECS=600         YAP_SILENCE_DB=-60
 #
 # PROGRESS: Omarchy's OSD, a single surface updated in place (the same one the volume keys use).
@@ -49,9 +56,12 @@
 #   * A custom readout (seconds, not "<pct>%") needs the shell IPC directly: the omarchy-osd CLI
 #     hardcodes progressText.
 #
-# Input failures are reported instead of failing silently: no mic connected (detected before
-# recording, from port availability), pure silence (from the clip's own volumedetect levels), and
-# "nothing transcribed" (with the measured level).
+# Input failures are reported instead of failing silently, and the popup names the CAUSE rather
+# than printing whatever numbers happened to be at hand: no mic connected (before recording, from
+# port availability), a dead-silent clip (the clip's own volumedetect levels), a recording
+# that lost most of its audio (clip length against wall time), a live mic with nothing said (the
+# daemon's verdict), the daemon not running (its exit code), a failed or timed-out remote
+# fallback, and an unknown failure (exit code plus the facts).
 set -uo pipefail
 
 # ── config ────────────────────────────────────────────────────────────────────────
@@ -86,6 +96,7 @@ while [ $# -gt 0 ]; do
     --deliver-test)    MODE="deliver-test"; shift ;;
     --dry-run)         MODE="dry-run"; shift ;;
     --bar-test)        MODE="bar-test"; shift ;;
+    --fail-test)       MODE="fail-test"; shift ;;
     --transcribe-test) MODE="transcribe-test"; TFILE="${2:-}"; shift; [ -n "${TFILE:-}" ] && shift ;;
     --progress-test)   MODE="progress-test"; PTSECS="${2:-6}"; shift 2 ;;
     --no-type)         NO_TYPE=1; shift ;;
@@ -95,6 +106,8 @@ while [ $# -gt 0 ]; do
 done
 
 notify() {
+  # YAP_NOTIFY_DRY=1 prints instead of posting --fail-test walks every message that way.
+  if [ -n "${YAP_NOTIFY_DRY:-}" ]; then printf 'notify %sms: %s | %s\n' "$1" "$2" "${3:-}"; return 0; fi
   command -v notify-send >/dev/null 2>&1 && notify-send -a yap -t "$1" "$2" "${3:-}"
   return 0
 }
@@ -264,6 +277,42 @@ deliver() {
   return 1
 }
 
+# ── failure reporting ───────────────────────────────────────────────────
+# Which failure was it, asked in one place. Everything below is already measured by the time the
+# transcript comes back empty, so the popup names the state and carries the numbers, instead of
+# printing the numbers and leaving the state to be inferred. --fail-test walks every branch.
+report_empty() {   # report_empty <daemon-rc> <where> <clip-secs> <wall-secs> <peak-db> <ms> <remote-rc>
+  local rc="$1" where="$2" dur="$3" wall="$4" peak="${5:-?}" ms="$6" remote_rc="${7:-0}"
+  local facts="${dur}s captured of ${wall}s recording · peak ${peak} dB · ${where} ${ms}ms"
+  [ -n "${YAP_NOTIFY_DRY:-}" ] || cp "$CLIP" "$HOME/yap-failed.wav" 2>/dev/null
+
+  case "$rc" in
+    0)
+      if [ "$where" = "remote" ] && [ "$remote_rc" != 0 ]; then
+        if [ "$remote_rc" = 124 ]; then
+          notify 12000 "yap: remote transcription timed out" "no answer within ${REMOTE_TIMEOUT}s — $facts"
+        else
+          notify 12000 "yap: remote transcription failed" "exit ${remote_rc} — $facts"
+        fi
+      elif awk -v d="$dur" -v w="$wall" 'BEGIN{exit !(w - d > 2 && d < w * 0.6)}'; then
+        # The clip is much shorter than the recorder ran: audio never arrived.
+        notify 12000 "yap: microphone produced almost no audio" \
+          "$facts — the input went quiet mid-recording: asleep, muted, or taken by another app"
+      else
+        notify 12000 "yap: no speech detected" \
+          "$facts — mic live, nothing said (the speech detector found no speech) · clip: ~/yap-failed.wav"
+      fi ;;
+    6) notify 12000 "yap: no speech detected" \
+         "$facts — the clip has no speech in it (the local detector found none; no fallback run)" ;;
+    3) notify 12000 "yap: transcription daemon is not running" \
+         "no socket at $SOCK — start the daemon, then press SUPER+H again" ;;
+    2 | 4) notify 12000 "yap: no audio in the clip" \
+         "$facts — capture produced nothing to transcribe" ;;
+    *) notify 12000 "yap: transcription failed (unknown cause)" \
+         "daemon exit ${rc} — $facts · clip: ~/yap-failed.wav" ;;
+  esac
+}
+
 # ── input device state ─────────────────────────────────────────────────────────────
 src_block() {
   pactl list sources 2>/dev/null | awk -v s="$1" '
@@ -340,6 +389,7 @@ buf = bytearray()
 framed = None          # None = undecided, True = framed daemon, False = raw text daemon
 chunks = []            # transcript pieces
 last_prog = None
+no_speech = False      # the daemon answered "the VAD found no speech in this clip"
 while True:
     try:
         chunk = s.recv(65536)
@@ -349,13 +399,13 @@ while True:
         break
     buf += chunk
     if framed is None:
-        framed = buf[0] in (1, 2)          # control byte = new framed daemon
+        framed = buf[0] in (1, 2, 3)       # control byte = new framed daemon
     if not framed:
         continue
     # parse as many complete frames as the buffer holds
     while len(buf) >= 9:
         kind = buf[0]
-        if kind not in (1, 2):
+        if kind not in (1, 2, 3) and kind >= 8:
             framed = False                 # protocol slipped — treat the rest as text
             break
         try:
@@ -375,13 +425,18 @@ while True:
             if value != last_prog:
                 last_prog = value
                 write_progress(value)
-        else:
+        elif kind == 2:
             chunks.append(payload.decode("utf-8", "replace"))
+        elif kind == 3:
+            no_speech = True               # a frame type this build does not know is skipped
 if framed:
     write_progress(100)
 else:
     chunks.append(bytes(buf).decode("utf-8", "replace"))
-sys.stdout.write("".join(chunks))
+text = "".join(chunks)
+sys.stdout.write(text)
+if no_speech and not text.strip():
+    sys.exit(6)                            # tells the shell: silence, skip the fallback
 PY
 }
 
@@ -391,6 +446,25 @@ if [ "$MODE" = "bar-test" ]; then
   echo "classes: ghostty -> $(paste_chord com.mitchellh.ghostty) | chromium -> $(paste_chord chromium)"
   echo "osd present: $(command -v omarchy-osd || echo MISSING)"
   echo "phases: recording = mic + seconds (text) | transcribing = bar (daemon-reported %)"
+  exit 0
+fi
+
+if [ "$MODE" = "fail-test" ]; then
+  export YAP_NOTIFY_DRY=1
+  echo "== a live mic with nothing said =="
+  report_empty 0 local 1.1 1.6 33.2 12 0
+  echo "== the recorder ran far longer than the clip =="
+  report_empty 0 local 1.1 7.0 33.2 12 0
+  echo "== the daemon reported no speech =="
+  report_empty 6 local 1.1 1.6 33.2 12 0
+  echo "== daemon not running =="
+  report_empty 3 local 0 0 "?" 0 0
+  echo "== remote fallback timed out =="
+  report_empty 0 remote 3.0 4.0 22.0 12 124
+  echo "== remote fallback failed =="
+  report_empty 0 remote 3.0 4.0 22.0 12 1
+  echo "== unknown daemon failure =="
+  report_empty 1 local 3.0 4.0 22.0 12 0
   exit 0
 fi
 
@@ -406,11 +480,12 @@ if [ "$MODE" = "transcribe-test" ]; then
   transcribing_progress &
   TICK=$!
   OUT="$(ask_local "$FILE" 2>/dev/null | tr -d '\r')"
+  RC=$?
   rm -f "$MARKS"
   sleep 0.4
   kill "$TICK" "$SEQ" 2>/dev/null
   echo "progress values seen: $(paste -sd' ' "$SD/prog-seq.txt")"
-  echo "transcript: $(printf '%s' "$OUT" | wc -c) bytes"
+  echo "transcript: $(printf '%s' "$OUT" | wc -c) bytes (client exit ${RC:-?}: 6 = no speech)"
   printf '%s' "$OUT" | head -c 160; echo
   exit 0
 fi
@@ -549,6 +624,8 @@ fi
 : >"$LOG"
 START_ADDR="$(focused_addr)"
 START_TITLE="$(focused_title)"
+DESC="$(src_desc "$SRC")"
+T_START="$(date +%s%N)"
 
 ffmpeg -hide_banner -nostdin -loglevel info -f pulse -i "$SRC" \
   -ac 1 -ar 16000 -t "$MAXSECS" -af volumedetect -y "$CLIP" 2>"$LOG" &
@@ -560,10 +637,13 @@ TICK=$!
 wait "$REC"
 rm -f "$PIDF"
 kill "$TICK" 2>/dev/null
+# Press-to-press, so the message can say whether the clip is as long as the recording was.
+WALL="$(awk -v a="$T_START" -v b="$(date +%s%N)" 'BEGIN{printf "%.1f", (b - a) / 1000000000}')"
 
 DUR="$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$CLIP" 2>/dev/null)"
 if [ -z "${DUR:-}" ]; then
-  notify 7000 "yap: capture failed" "$(grep -iE 'error|no such|invalid' "$LOG" | tail -1 | cut -c1-140)"
+  notify 9000 "yap: capture failed" \
+    "${DESC:-$SRC}: $(grep -iE 'error|no such|invalid' "$LOG" | tail -1 | cut -c1-120)"
   exit 1
 fi
 
@@ -586,23 +666,36 @@ touch "$MARKS"
 transcribing_progress &
 TTICK=$!
 
+# The exit code separates "the daemon answered with nothing" (0) from "there was no daemon to
+# answer" (3) and "the clip was unusable" (2/4). pipefail is on so it survives the tr; without
+# it a dead daemon read as "nothing transcribed".
 TEXT="$(ask_local "$CLIP" 2>/dev/null | tr -d '\r')"
+DAEMON_RC=$?
 WHERE="local"
-if [ -z "${TEXT//[[:space:]]/}" ] && [ -n "$REMOTE_CMD" ]; then
-  WHERE="remote"
-  printf '%s' -1 >"$PROG"     # the remote path has no progress framing
-  TEXT="$(timeout "$REMOTE_TIMEOUT" sh -c "$REMOTE_CMD" <"$CLIP" 2>/dev/null | tr -d '\r')"
+REMOTE_RC=0
+# rc 6 is the daemon's own no-speech verdict: an answer, not a miss. The fallback is for
+# audio the local model could not turn into text, so asking it about silence only costs the
+# round trip. YAP_REMOTE_ON_SILENCE=1 in the config restores the old behaviour.
+if [ "$DAEMON_RC" != 6 ] || [ -n "${YAP_REMOTE_ON_SILENCE:-}" ]; then
+  if [ -z "${TEXT//[[:space:]]/}" ] && [ -n "$REMOTE_CMD" ]; then
+    WHERE="remote"
+    printf '%s' -1 >"$PROG"     # the remote path has no progress framing
+    TEXT="$(timeout "$REMOTE_TIMEOUT" sh -c "$REMOTE_CMD" <"$CLIP" 2>/dev/null | tr -d '\r')"
+    REMOTE_RC=$?
+  fi
 fi
 TEXT="$(printf '%s' "$TEXT" | sed '/^[[:space:]]*$/d')"
 
 rm -f "$MARKS"
 kill "$TTICK" 2>/dev/null
 MS=$(( ($(date +%s%N) - T0) / 1000000 ))
+# One line per run: the whole press-to-result timeline, so a slow press can be read off instead
+# of guessed at. captured = what landed in the clip, wall = press-to-press, daemon = transcription.
+printf 'timing: captured=%ss wall=%ss daemon=%sms where=%s total=%sms\n' \
+  "$DUR" "$WALL" "$MS" "$WHERE" "$(( ($(date +%s%N) - T_START) / 1000000 ))" >>"$LOG"
 
 if [ -z "$TEXT" ]; then
-  cp "$CLIP" "$HOME/yap-failed.wav" 2>/dev/null
-  notify 9000 "yap: nothing transcribed" \
-    "dur=${DUR}s peak=${MAXV:-?}dB ${WHERE} ${MS}ms — clip: ~/yap-failed.wav"
+  report_empty "$DAEMON_RC" "$WHERE" "$DUR" "$WALL" "${MAXV:-?}" "$MS" "$REMOTE_RC"
   exit 1
 fi
 

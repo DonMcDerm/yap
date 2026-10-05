@@ -48,7 +48,8 @@ Two optional config files, both created on demand:
 - `~/.config/yap/config` — sourced by the client. `YAP_REMOTE` (a command that reads audio on
   stdin and prints text on stdout; empty = no fallback), `YAP_REMOTE_TIMEOUT` (180),
   `YAP_DIR` (`~/.cache/yap`), `YAP_SOCK` (`$YAP_DIR/stt.sock`), `YAP_MAX_SECS` (600),
-  `YAP_SILENCE_DB` (-60).
+  `YAP_SILENCE_DB` (-60), `YAP_REMOTE_ON_SILENCE` (set = send silent clips to the fallback
+  anyway, the pre-v5 behaviour).
 - `~/.config/yap/prompt.txt` — the decoder vocabulary (see Accuracy knobs).
 
 Daemon environment, set in the unit: `YAP_MODEL` (default `small.en`; `small`/`large-v3` for
@@ -74,8 +75,8 @@ to another compositor, the two functions to replace are `focused_addr` (window i
 
 | path | what it is |
 |---|---|
-| `bin/yap` | the client: bash, ~590 lines. Capture, OSD, focus tracking, delivery, self-tests |
-| `src/sttd.py` | the daemon: python, ~265 lines. Model load, socket, protocol, progress |
+| `bin/yap` | the client: bash, ~700 lines. Capture, OSD, focus tracking, delivery, self-tests |
+| `src/sttd.py` | the daemon: python, ~280 lines. Model load, socket, protocol, progress |
 | `systemd/yap-sttd.service.in` | unit template; `install.sh` substitutes `@VENV@ @PYVER@ @MODEL@ @DATADIR@` |
 | `install.sh` | venv + pinned deps, files, rendered unit, service |
 | `remote/transcribe-stdin` | optional fallback helper for another machine (stdin audio → stdout text) |
@@ -90,16 +91,22 @@ the socket, and pastes the reply. The daemon loads the model once at start and s
 serially. Keep the daemon free of any agent-framework imports — it needs `faster_whisper` and
 nothing else.
 
-## Socket protocol (v4)
+## Socket protocol (v5)
 
     client -> daemon:  8 ASCII digits (byte length) then the raw audio bytes
     daemon -> client:  FRAME = type byte + 8 ASCII digits (payload length) + payload
                          \x01 <len> <percent>            progress, as the decoder advances
                          \x02 <len> <utf-8 transcript>   final text, then the daemon closes
+                         \x03 <len 0>                    no speech: the VAD kept no audio at all
 
 Control bytes cannot appear in a transcript, so the client decides framing from the first byte:
-`1`/`2` means framed, anything else means an older daemon replying with raw text and the whole
-stream is passed through. Progress is free: `transcribe()` returns a generator of segments, so
+`1`/`2`/`3` means framed, anything else means an older daemon replying with raw text and the whole
+stream is passed through; an unknown control frame is skipped rather than treated as text. `\x03`
+exists because an empty transcript from the local model is exactly what the remote fallback is
+for, so by the text alone the client cannot tell "the VAD found no speech" from "the local model
+missed" — it exits 6 on that frame, which skips the fallback and reports no speech directly.
+
+Progress is free: `transcribe()` returns a generator of segments, so
 each iteration is one decoded step and `segment.end / info.duration` is real completion. Frames
 are throttled to one per 100 ms and only on a percent change. After changing the daemon, restart
 it and confirm the `listening on …` line before testing the client.
@@ -158,9 +165,13 @@ window — observed for real, with a Tab that opened a browser tab.
 - **`Environment=` values with spaces are silently truncated by systemd.** It logs
   `Invalid environment assignment, ignoring: <word>` and keeps only the first token. That is why
   the decoder prompt is a file, not an inline unit value.
-- **Silence transcribes to nothing.** VAD removes 100 % of a dead-mic clip and returns an empty
-  string without complaint. The client checks the input port *before* recording and the clip peak
-  *after*, and names which one failed.
+- **Silence transcribes to nothing, and an empty transcript is what the fallback retries.** VAD
+  removes 100 % of a dead-mic clip and returns an empty string without complaint, so a silent press
+  used to cost the whole remote round trip — measured at 4.8 s, with the clip uploaded to the other
+  machine — before the popup could say anything. The daemon now reports that case as its own
+  verdict (`duration_after_vad` ≈ 0 → frame `\x03`) and the client skips the fallback on it. The
+  input port is still checked *before* recording and the clip peak *after*, so a dead microphone is
+  named before any of this runs.
 - **USB mics publish `availability unknown`, not `available`.** Only `not available` on *all*
   ports means an empty jack; treating "unknown" as unplugged blocks every dictation.
 - **Do not drive progress with `notify-send` on Omarchy** — quickshell re-shows the popup on each
@@ -180,14 +191,15 @@ Both halves run on a CPU-only box, so nothing here needs the desktop session:
     python3 ask_local.py clip16k.wav /tmp/yap-test/stt.sock /tmp/yap-test/progress
 
 Expect the daemon log to print `N s audio / N bytes -> N chars in N s (Nx realtime, cpu/int8, N
-progress frames)` and the progress file to end at `100`. Any 16 kHz mono speech wav will do.
+progress frames, vad N s)` and the progress file to end at `100`. Any 16 kHz mono speech wav will do.
 
     # the fallback helper: a "venv" whose python exports PYTHONPATH, then pipe audio in
     YAP_REMOTE_VENV=/tmp/fakevenv ./remote/transcribe-stdin < clip16k.wav
 
 Self-tests that need no audio at all, runnable on a live desktop: `yap --bar-test`,
 `yap --dry-run` (prints the delivery decision; sends nothing), `yap --deliver-test` (asserts a
-focus change routes to the clipboard). `yap --transcribe-test FILE` runs a wav through the real
+focus change routes to the clipboard), `yap --fail-test` (prints every failure message with
+`YAP_NOTIFY_DRY=1`, so nothing is posted and no audio is needed). `yap --transcribe-test FILE` runs a wav through the real
 daemon and prints the progress sequence.
 
 ## Repo conventions
