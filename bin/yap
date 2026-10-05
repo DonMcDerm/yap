@@ -279,6 +279,13 @@ deliver() {
     return 0
   fi
 
+  # Store BEFORE anything can be typed — and before the focus check, because the focus-changed branch
+  # is exactly when the text has to exist somewhere: its OSD says "copied · focus moved" and its
+  # notification promises SUPER+SHIFT+H will insert it. --dry-run returns above this point, so its
+  # 40-char PREVIEW still cannot overwrite $LAST (found the hard way, 2026-10-03).
+  printf '%s\n' "$text" >"$LAST"
+  printf '%s' "$text" | wl-copy 2>/dev/null
+
   if [ -n "$start_addr" ] && [ "$cur" != "$start_addr" ]; then
     printf 'delivery: skipped(focus moved) chord=%s target=%s class=%s start=%s\n' \
       "$chord" "${cur:-none}" "${cls:-?}" "${start_addr:-none}" >>"$LOG"
@@ -287,12 +294,6 @@ deliver() {
       "SUPER+SHIFT+H inserts it here · recorded from: ${START_TITLE:-?}${cap_note}"
     return 2
   fi
-
-  # Store BEFORE anything can be typed — but only on the real delivery path. Doing this at the top
-  # of deliver() meant --dry-run wrote its 40-char PREVIEW over $LAST and the clipboard, destroying
-  # the previous transcript (found the hard way, 2026-10-03).
-  printf '%s\n' "$text" >"$LAST"
-  printf '%s' "$text" | wl-copy 2>/dev/null
 
   if [ "$NO_TYPE" = 1 ]; then
     printf 'delivery: skipped(--no-type) chord=%s target=%s\n' "$chord" "${cur:-none}" >>"$LOG"
