@@ -195,9 +195,19 @@ transcribing_progress() {
 }
 
 # ── focus + paste ─────────────────────────────────────────────────────────────────
-focused_addr()  { hyprctl -j activewindow 2>/dev/null | jq -r '.address // ""' 2>/dev/null; }
-focused_class() { hyprctl -j activewindow 2>/dev/null | jq -r '.class // ""' 2>/dev/null; }
-focused_title() { hyprctl -j activewindow 2>/dev/null | jq -r '.title // "?"' 2>/dev/null | cut -c1-60; }
+# One hyprctl+jq call per focus read — every field comes out of the same JSON, and each spawn pair
+# costs ~8ms (measured). A press reads the focus twice, at the keypress and at delivery, so the
+# callers that want two fields load once into F_*; the accessors each load fresh.
+F_ADDR=""; F_CLS=""; F_TITLE=""
+focus_load() {
+  local line
+  line="$(hyprctl -j activewindow 2>/dev/null | jq -r '[(.address // ""), (.class // ""), (.title // "?")] | @tsv' 2>/dev/null)"
+  F_ADDR="${line%%$'\t'*}"; line="${line#*$'\t'}"
+  F_CLS="${line%%$'\t'*}";  F_TITLE="${line#*$'\t'}"
+}
+focused_addr()  { focus_load; printf '%s' "$F_ADDR"; }
+focused_class() { focus_load; printf '%s' "$F_CLS"; }
+focused_title() { focus_load; printf '%s' "${F_TITLE:0:60}"; }
 
 # Terminals want ctrl+shift+v; everything else ctrl+v. One keystroke either way.
 paste_chord() {
@@ -649,8 +659,8 @@ if [ "$STATE" != "ok" ]; then
 fi
 
 : >"$LOG"
-START_ADDR="$(focused_addr)"
-START_TITLE="$(focused_title)"
+focus_load
+START_ADDR="$F_ADDR"; START_TITLE="${F_TITLE:0:60}"
 DESC="$(src_desc "$SRC")"
 T_START="$(date +%s%N)"
 
@@ -667,7 +677,17 @@ kill "$TICK" 2>/dev/null
 # Press-to-press, so the message can say whether the clip is as long as the recording was.
 WALL="$(awk -v a="$T_START" -v b="$(date +%s%N)" 'BEGIN{printf "%.1f", (b - a) / 1000000000}')"
 
-DUR="$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$CLIP" 2>/dev/null)"
+# Clip duration from the WAV header instead of a ffprobe spawn (measured: 38ms per press). The
+# recorder always writes 16kHz mono s16 (the ffmpeg line above), so the data chunk is a fixed 32000
+# bytes per second after a 44-byte header. A file too small to hold a header still leaves DUR empty
+# and takes the capture-failed path below.
+DUR=""
+CLIP_BYTES="$(stat -c %s "$CLIP" 2>/dev/null || echo 0)"
+if [ "${CLIP_BYTES:-0}" -gt 44 ]; then
+  DUR="$(awk -v b="$CLIP_BYTES" 'BEGIN{printf "%.6f", (b - 44) / 32000}')"
+else
+  DUR="$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$CLIP" 2>/dev/null)"
+fi
 if [ -z "${DUR:-}" ]; then
   notify 9000 "yap: capture failed" \
     "${DESC:-$SRC}: $(grep -iE 'error|no such|invalid' "$LOG" | tail -1 | cut -c1-120)"
