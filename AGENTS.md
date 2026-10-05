@@ -68,8 +68,9 @@ yap targets Omarchy (Hyprland + quickshell) and is not written to be portable. T
 are the progress OSD (`omarchy-osd`, or `omarchy-shell -q osd show` for a custom readout) and
 `o.bind`. Both degrade gracefully — with no `omarchy-osd`, progress becomes a single replaced
 `notify-send` bubble — and the binds are plain config lines on stock Hyprland. If you are porting
-to another compositor, the two functions to replace are `focused_addr` (window identity) and
-`send_paste` (a paste chord via `wtype`) in `bin/yap`.
+to another compositor, the two functions to replace are `focus_load` (window identity) and
+`send_paste` (the paste chord — dispatched through the compositor here, `wtype` as its fallback) in
+`bin/yap`.
 
 ## Layout
 
@@ -81,6 +82,7 @@ to another compositor, the two functions to replace are `focused_addr` (window i
 | `install.sh` | venv + pinned deps, files, rendered unit, service |
 | `remote/transcribe-stdin` | optional fallback helper for another machine (stdin audio → stdout text) |
 | `examples/hyprland.lua` | the two binds |
+| `bench/bench-yap.sh` | component timings on a live desktop (see Measured performance) |
 
 ## Architecture
 
@@ -113,7 +115,7 @@ it and confirm the `listening on …` line before testing the client.
 
 ## Measured performance
 
-157 s speech fixture, `small.en`, Ryzen 7 5800X3D + RTX 5070:
+Decode, 157 s speech fixture, `small.en`, Ryzen 7 5800X3D + RTX 5070:
 
 | config | time | realtime |
 |---|---|---|
@@ -121,17 +123,41 @@ it and confirm the `listening on …` line before testing the client.
 | cpu int8, 16 threads | 10.0 s | 16x |
 | cuda float16 | 8.9 s | 18x |
 | cuda int8_float16 | 1.8 s | 89x |
-| cuda float32 | 1.5 s | 103x |
+| cuda float32, greedy (`beam_size=1`) | 1.5 s | 103x |
+| cuda float32, as shipped (beam 5 + prompt) | 3.1 s | 50x |
 
 Two non-obvious results drive the device ladder: `float16` is the *slow* path on a consumer GPU
 while `float32` is the fast one, and threads above the physical core count make ctranslate2
-slower through SMT contention.
+slower through SMT contention. The last row is what actually ships — the accuracy settings roughly
+double the decode of the same clip (re-measured 2026-10-05, GPU at 84-91 % during the run, so that
+is throughput and not contention). Shorter clips pay much less per second of audio: 11 s of speech
+decodes in 0.25 s (42x), because the VAD trims it and the model is warm.
+
+What the other pieces cost, same machine, medians of 5 runs (`bench/bench-yap.sh`):
+
+| what | cost |
+|---|---|
+| capture start — ffmpeg `-f pulse` (native PipeWire 271 ms, libpulse 4009 ms) | 212 ms |
+| ffmpeg SIGINT → exit, i.e. the stop press letting go | 131 ms |
+| decode, per press (silence / short clip / 157 s clip) | 18 / 250 / 3100 ms |
+| paste chord — compositor dispatch vs the old wtype release-and-sleep shape | 59 / 135 ms |
+| `omarchy-osd` text / `omarchy-shell osd show` bar | 26 / 23 ms |
+| `python3 -c pass` (the socket client) | 10 ms |
+| `pactl get-default-source` + `pactl list sources` | 11 ms |
+| `hyprctl -j activewindow \| jq` (one focus read) | 4 ms |
+| `notify-send` / `wl-copy` | 4 / 2 ms |
+
+So beyond the recording itself, a press costs the capture start, the decode, and ~90 ms of client
+work — of which the paste used to be 135 ms on its own. The readout forks one OSD per second while
+recording and one per 0.25 s while transcribing; that overlaps the talking, so it buys CPU cost
+rather than latency.
 
 ### Accuracy knobs
 
 Greedy decode mangles exactly the words that matter — names, jargon, acronyms. `YAP_BEAM=5` (the
 default) replaces `beam_size=1`, and a vocabulary list biases the decoder toward the user's own
-terms (measured: +0.7 s on the 155 s clip). Bias with `hotwords` when the installed
+terms (measured 2026-10-05: the 157 s fixture goes from 1.5 s greedy to 3.1 s with beam 5 plus the
+prompt). Bias with `hotwords` when the installed
 faster-whisper supports it, `initial_prompt` otherwise. The vocabulary is **empty by default** —
 ship the tool, not somebody else's word list. The user sets theirs in
 `~/.config/yap/prompt.txt`, or in `YAP_PROMPT` (which wins when set at all, including when set to
@@ -140,15 +166,26 @@ value containing spaces must be quoted, and quoting adds escape rules of its own
 
 ## Delivery model — the constraints are real, do not relax them
 
-On Wayland there is no way to inject keys into a *specific* window; `wtype` writes to whatever is
+On Wayland there is no way to inject keys into a *specific* window; the chord goes to whatever is
 focused. Therefore:
 
-1. the transcript is written to the clipboard and `~/.cache/yap/last.txt` **before** any typing,
-   so it cannot be lost;
+1. the transcript is written to the clipboard and `~/.cache/yap/last.txt` **before** anything can be
+   typed — and **before** the focus check, because the focus-changed branch is exactly the case
+   where the text has to exist somewhere;
 2. exactly **one** keystroke is sent — a paste chord — and only if the window focused at record
    start is still focused (compare `hyprctl -j activewindow` addresses, never titles: titles
    change and a reopened window gets a new address);
 3. otherwise nothing is typed and a notification says the text is on the clipboard.
+
+The chord is **dispatched by the compositor** (`hl.dsp.send_key_state` through `hyprctl eval`), the
+mechanism the desktop's own SUPER+V uses: SHIFT+Insert in terminals, CTRL+V elsewhere. It is not a
+virtual keyboard, deliberately. `wtype` cannot carry modifiers, so the SUPER still held from the
+keybind merges into the chord at the seat, the terminal receives super+shift+insert, and with the
+Hermes CLI's modifyOtherKeys active that arrives as literal text. The old shape worked around it by
+releasing every modifier, sleeping 120 ms and then injecting — measured 135 ms per paste against
+59 ms for the dispatch, which carries its own mods and needs no settling. Down and up go as two
+dispatches 50 ms apart, because a single dispatch that both presses and releases can leave
+synthetic key state stuck.
 
 Never reintroduce keystroke streaming. A 5.5k-character transcript is thousands of synthetic
 events over seconds, and any key pressed during that window retargets the remainder into another
@@ -179,6 +216,22 @@ window — observed for real, with a Tab that opened a browser tab.
 - **Starting the daemon in a test and killing it in the same shell command** costs you the
   wrapper process if you use `pkill -f` with a pattern that also matches your own command line.
   Kill by explicit PID.
+- **An early `return` before the clipboard write loses the transcript.** The focus-changed branch
+  used to return before storing, while its OSD read "copied · focus moved" and its notification
+  promised that SUPER+SHIFT+H would insert it — so `--last` inserted a *stale* transcript and the
+  clipboard held something else. `--deliver-test` fails on exactly that; it went unnoticed because
+  the branch is only reached when focus moves mid-dictation (found 2026-10-05). Store first, then
+  branch.
+- **`hyprctl eval` is write-only.** A dispatch the compositor rejects comes back as `ok`, the same
+  as one it accepted, so the client cannot verify that a paste landed. That is the reason the text
+  is on the clipboard and in `last.txt` before the chord is sent, and why the paste failure message
+  is worded as a possibility rather than a diagnosis. `--chord=ctrl+v|shift+insert` forces either
+  branch for testing.
+- **Clip duration comes from the WAV header, not ffprobe** — the recorder always writes 16 kHz mono
+  s16, so it is `(bytes - 44) / 32000`, and that saved a 38 ms spawn per press. ffprobe stays as the
+  fallback for a file too small to hold a header, which is also the capture-failed path.
+- **Every `focused_*` call costs a process pair** (`hyprctl` ~5 ms + `jq` ~3 ms). Where two fields
+  are needed, call `focus_load` once and read `F_ADDR` / `F_CLS` / `F_TITLE`.
 
 ## Testing without a microphone or a desktop
 
@@ -198,9 +251,20 @@ progress frames, vad N s)` and the progress file to end at `100`. Any 16 kHz mon
 
 Self-tests that need no audio at all, runnable on a live desktop: `yap --bar-test`,
 `yap --dry-run` (prints the delivery decision; sends nothing), `yap --deliver-test` (asserts a
-focus change routes to the clipboard), `yap --fail-test` (prints every failure message with
-`YAP_NOTIFY_DRY=1`, so nothing is posted and no audio is needed). `yap --transcribe-test FILE` runs a wav through the real
-daemon and prints the progress sequence.
+focus change routes the transcript to the clipboard **and** to `last.txt`), `yap --fail-test`
+(prints every failure message with `YAP_NOTIFY_DRY=1`, so nothing is posted and no audio is
+needed), and `yap --chord=shift+insert` to hold either paste branch still while testing.
+
+To test a press with no microphone anywhere in it: put the speech in a throwaway sink and record
+its monitor — `pactl load-module module-null-sink sink_name=yap_test`, play a fixture into it with
+`paplay --device=yap_test`, and record with `yap --source yap_test.monitor`. Unload the module
+afterwards (`pactl unload-module`) so no device is left behind. Focus, clipboard and the OSD are
+still touched by such a test; restore them.
+
+`bench/bench-yap.sh [runs]` re-measures the numbers in Measured performance on a live desktop: each
+tool the client spawns, the capture start, the stop press, the decode through the warm daemon, and
+one press through the client itself. The press section uses the default source, with the stop press
+timeboxed and the recorder swept afterwards so a missed stop cannot leave a ten-minute recording.
 
 ## Repo conventions
 
